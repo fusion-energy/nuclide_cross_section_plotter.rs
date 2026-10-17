@@ -4,7 +4,7 @@ import * as arrow from 'apache-arrow';
 import lz4 from 'lz4js';
 import { createArrowDecoder } from '../arrow.js';
 import { createEngine } from '../engine.js';
-import { fixtureFetch } from './fixture_fetch.mjs';
+import { fixtureFetch, fixtureLatest, FIXTURE_RELEASE } from './fixture_fetch.mjs';
 
 const ORIGIN = 'https://data.test';
 const decoder = createArrowDecoder(arrow, lz4.decompress);
@@ -15,16 +15,18 @@ function engine(opts = {}) {
   return { engine: createEngine({ origin: ORIGIN, fetchImpl, decoder }), log: fetchImpl.log };
 }
 
-test('a series is version.json plus two range requests, then one per further MT', async () => {
+test('a series is latest.json, version.json and two range requests, then one per further MT', async () => {
   const { engine: e, log } = engine();
   const s1 = await e.series('endf-b8.1', 'Li6', 1, '294K');
   assert.equal(s1.mt, 1);
   assert.equal(s1.temperature, '294K');
   assert.equal(s1.energy.length, s1.xs.length);
   assert.ok(s1.xs.every(Number.isFinite));
-  // version.json, energy (schema + grid as two spans), reactions (schema + batch)
+  // latest.json, version.json, energy (schema + grid as two spans), reactions (schema + batch)
   const first = log.map((l) => `${l.url.split('/').pop()}${l.range ? ' ranged' : ''}`);
-  assert.deepEqual(first.slice(0, 1), ['version.json']);
+  assert.deepEqual(first.slice(0, 2), ['latest.json', 'version.json']);
+  assert.ok(log.slice(1).every((l) => l.url.startsWith(`/endf-b8.1/${FIXTURE_RELEASE}/neutron/Li6.arrow/`)),
+    'every file comes from the release latest.json names');
   assert.ok(first.filter((f) => f === 'energy.arrow ranged').length >= 1);
   assert.ok(first.filter((f) => f === 'reactions.arrow ranged').length >= 1);
   const n = log.length;
@@ -77,7 +79,8 @@ test('temperatures are listed in numeric order with 0K last', async () => {
   const { engine: e } = engine();
   const entry = await e.ensureNuclide('endf-b8.1', 'Li6');
   assert.deepEqual(e.temperaturesOf(entry), ['250K', '294K', '600K', '900K', '1200K', '2500K', '0K']);
-  assert.equal(entry.dataVersion, '2026-09-18');
+  assert.equal(entry.dataVersion, '2026-10-12.1');
+  assert.equal(entry.release, '2026-10-12.1');
 });
 
 test('a photon element decodes to an eV grid and five cross sections', async () => {
@@ -91,4 +94,36 @@ test('a photon element decodes to an eV grid and five cross sections', async () 
   assert.equal(log.filter((l) => l.url.endsWith('element.arrow')).length, 1);
   await assert.rejects(e.photonSeries('endf-b8.1', 'H', 501), /has no photon MT 501/);
   await assert.rejects(e.photonSeries('jeff-4.0', 'Fe', 502), /Fe is not published in jeff-4.0/);
+});
+
+test('latest.json is read once per library and shared by neutron, photon and index', async () => {
+  const { engine: e, log } = engine();
+  await Promise.all([
+    e.series('endf-b8.1', 'Li6', 1, '294K'),
+    e.photonSeries('endf-b8.1', 'H', 502),
+    e.loadIndex('endf-b8.1', 'neutron'),
+  ]);
+  assert.equal(log.filter((l) => l.url === '/endf-b8.1/latest.json').length, 1);
+  const index = await e.loadIndex('endf-b8.1', 'neutron');
+  assert.equal(index.data_version, FIXTURE_RELEASE);
+});
+
+test('a release in a data format this page cannot read is refused by name', async () => {
+  const { engine: e } = engine({ latest: (library) => fixtureLatest(library, { format_version: 3 }) });
+  await assert.rejects(e.series('endf-b8.1', 'Li6', 1, '294K'), /endf-b8.1 release 2026-10-12.1 is data format 3; this page reads format 2/);
+  const { engine: wrong } = engine({ latest: () => fixtureLatest('jeff-4.0') });
+  await assert.rejects(wrong.loadIndex('endf-b8.1', 'neutron'), /latest.json is for jeff-4.0, not endf-b8.1/);
+});
+
+test('a range whose bytes do not match the sha256 in version.json is refused', async () => {
+  const fetchImpl = fixtureFetch({ origin: ORIGIN });
+  const corrupt = async (url, opts) => {
+    const resp = await fetchImpl(url, opts);
+    if (!url.endsWith('reactions.arrow') || resp.status !== 206) return resp;
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    bytes[bytes.length - 1] ^= 1;
+    return new Response(bytes, { status: 206, statusText: 'Partial Content' });
+  };
+  const e = createEngine({ origin: ORIGIN, fetchImpl: corrupt, decoder });
+  await assert.rejects(e.series('endf-b8.1', 'Li6', 1, '294K'), /reactions.arrow: bytes \d+\+\d+ have sha256 [0-9a-f]{64}, version.json says [0-9a-f]{64}/);
 });

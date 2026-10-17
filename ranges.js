@@ -6,7 +6,7 @@
 // cross section and every union energy grid is already a contiguous byte range
 // in its object. Each nuclide's `version.json` names those ranges
 // (`reaction_ranges` keyed by MT then temperature label, `energy_ranges` keyed
-// by temperature label, both as `[offset, length]`). This page draws one
+// by temperature label, both as `[offset, length, sha256]`). This page draws one
 // reaction at one temperature, so it asks for the schema plus the batches it
 // needs as HTTP range requests and splices them into an Arrow IPC stream the
 // wasm reader accepts. Fe56 at 294 K is about 340 kB for the total cross
@@ -26,9 +26,13 @@ export const EOS = new Uint8Array([0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
 /// wanted MT; the threshold matters when several MTs are fetched together.
 export const COALESCE_GAP = 16 * 1024;
 
-function range(pair) {
-  if (!Array.isArray(pair) || pair.length !== 2) return null;
-  return { off: pair[0], len: pair[1] };
+/// One index entry, `[offset, length, sha256]` (the sha256 of exactly those
+/// bytes), as `{off, len, sha256}`.
+function range(entry) {
+  if (!Array.isArray(entry) || entry.length !== 3) return null;
+  const [off, len, sha256] = entry;
+  if (!Number.isInteger(off) || !Number.isInteger(len) || typeof sha256 !== 'string') return null;
+  return { off, len, sha256 };
 }
 
 /// The byte-range index of `reactions.arrow` from a parsed `version.json`.

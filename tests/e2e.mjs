@@ -1,8 +1,9 @@
 // Drives the page in headless Chromium against fixture data.
 //
-// The data host is routed to tests/fixtures: `index.json` for ENDF/B-VIII.1
-// (Li6 and Li7 only, H for photons), and Li6's Arrow files, with `Range`
-// honoured (206) the way the real origin does it. With `--no-range` every
+// The data host is routed to tests/fixtures (see fixture_fetch.mjs): every
+// library's `latest.json`, `index.json` for ENDF/B-VIII.1 (Li6 and Li7 only,
+// H for photons), and Li6's Arrow files, with `Range` honoured (206) the way
+// the real origin does it. With `--no-range` every
 // request is answered whole with a 200, the case of a proxy that strips the
 // header, and the same steps must still pass. Everything else the page loads
 // is served from the repository, so the run needs no network beyond this.
@@ -11,24 +12,14 @@
 
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { chromium } from 'playwright';
+import { fixturePath, fixtureLatest } from './fixture_fetch.mjs';
 
 const args = process.argv.slice(2);
 const noRange = args.includes('--no-range');
 const urlIndex = args.indexOf('--url');
 const url = urlIndex >= 0 ? args[urlIndex + 1] : 'http://127.0.0.1:8000/';
-const FIX = new URL('./fixtures/', import.meta.url).pathname;
 const SHOTS = new URL('./screenshots/', import.meta.url).pathname;
 mkdirSync(SHOTS, { recursive: true });
-
-function fixturePath(pathname) {
-  // /endf-b8.1/neutron/Li6.arrow/energy.arrow -> Li6.arrow/energy.arrow
-  // /endf-b8.1/photon/H.arrow/element.arrow  -> H.photon.arrow/element.arrow
-  // /endf-b8.1/neutron/index.json            -> index/endf-b8.1/neutron/index.json
-  const [, library, particle, dir, file] = pathname.split('/');
-  if (dir === 'index.json') return `${FIX}index/${library}/${particle}/index.json`;
-  const stem = particle === 'photon' ? dir.replace(/\.arrow$/, '.photon.arrow') : dir;
-  return `${FIX}${stem}/${file}`;
-}
 
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
@@ -42,7 +33,8 @@ await page.route('https://yamc-data.xsplot.com/**', (route) => {
   const path = fixturePath(pathname);
   const range = route.request().headers()['range'];
   requests.push({ pathname, range: range ?? null });
-  if (!existsSync(path)) return route.fulfill({ status: 404, body: 'not found' });
+  if (path?.latest) return route.fulfill({ status: 200, json: fixtureLatest(path.latest) });
+  if (!path || !existsSync(path)) return route.fulfill({ status: 404, body: 'not found' });
   const whole = readFileSync(path);
   if (range && !noRange) {
     const m = /^bytes=(\d+)-(\d+)$/.exec(range);

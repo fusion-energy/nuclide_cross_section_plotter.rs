@@ -12,6 +12,11 @@
 // Photon data has no index and no temperature: `element.arrow` is fetched
 // whole once per element.
 //
+// Each library is published as immutable releases under
+// `<library>/<release>/`; `<library>/latest.json` names the current one. It is
+// read once per library per session, so every file of a library the page
+// shows comes from one release.
+//
 // Nothing here touches the DOM or `self`; the same code runs in the worker
 // and under Node against fixture files.
 
@@ -21,7 +26,15 @@ import { PHOTON_MTS } from './photon.js';
 import { LIBRARIES } from './libraries.js';
 
 export const ORIGIN = 'https://yamc-data.xsplot.com';
+/// The release `format_version`s this page can read.
+export const SUPPORTED_FORMAT_VERSIONS = Object.freeze([2]);
 const KNOWN_LIBRARIES = new Set(LIBRARIES.map((l) => l.id));
+
+/// Lower-case hex sha256 of `bytes`.
+async function sha256Hex(bytes) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 /// Build the engine around a decoder from `createArrowDecoder`.
 export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
@@ -30,6 +43,8 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
   /// Per-(library, nuclide) state, held as the in-flight promise so concurrent
   /// callers coalesce onto one download.
   const nuclides = new Map();
+  /// Per-library release id from `latest.json`, as the in-flight promise.
+  const releases = new Map();
   /// Per-(library, element) decoded photon data, likewise.
   const elements = new Map();
   /// Once a ranged request has come back as a whole object, something between
@@ -37,12 +52,44 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
   /// files so a plan of several spans does not download the file repeatedly.
   let rangesStripped = false;
 
-  const url = (library, particle, name, file) => `${origin}/${library}/${particle}/${name}.arrow/${file}`;
+  const url = (library, release, particle, name, file) =>
+    `${origin}/${library}/${release}/${particle}/${name}.arrow/${file}`;
 
   function checkLibrary(library) {
     if (!KNOWN_LIBRARIES.has(library)) {
       throw new Error(`unknown library ${library}; one of ${[...KNOWN_LIBRARIES].join(', ')}`);
     }
+  }
+
+  /// The current release of a library, read from its `latest.json` once.
+  function ensureRelease(library) {
+    checkLibrary(library);
+    if (!releases.has(library)) {
+      releases.set(library, loadRelease(library).catch((err) => {
+        releases.delete(library);
+        throw err;
+      }));
+    }
+    return releases.get(library);
+  }
+
+  async function loadRelease(library) {
+    const target = `${origin}/${library}/latest.json`;
+    const resp = await fetchImpl(target);
+    if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} fetching ${target}`);
+    const latest = await resp.json();
+    if (latest?.schema !== 'yamc-data-latest' || typeof latest.release !== 'string' || !latest.release) {
+      throw new Error(`${target} does not name a release`);
+    }
+    if (latest.keyword !== library) {
+      throw new Error(`${target} is for ${latest.keyword}, not ${library}`);
+    }
+    if (!SUPPORTED_FORMAT_VERSIONS.includes(latest.format_version)) {
+      throw new Error(
+        `${library} release ${latest.release} is data format ${latest.format_version}; ` +
+        `this page reads format ${SUPPORTED_FORMAT_VERSIONS.join(', ')}`);
+    }
+    return latest.release;
   }
 
   async function fetchBytes(target, range = null) {
@@ -63,8 +110,8 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
 
   /// Fetch a version.json, turning a 404 into the message a user picking a
   /// library needs (coverage differs: TENDL-2025 has no H1).
-  async function fetchVersion(library, particle, name) {
-    const target = url(library, particle, name, 'version.json');
+  async function fetchVersion(library, release, particle, name) {
+    const target = url(library, release, particle, name, 'version.json');
     const resp = await fetchImpl(target);
     if (resp.status === 404) throw new Error(`${name} is not published in ${library}`);
     if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} fetching ${target}`);
@@ -92,11 +139,12 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
   }
 
   async function loadNuclide(library, name) {
-    const version = await fetchVersion(library, 'neutron', name);
+    const release = await ensureRelease(library);
+    const version = await fetchVersion(library, release, 'neutron', name);
     const reactions = reactionRanges(version);
     const energy = energyRanges(version);
     const entry = {
-      library, name, version,
+      library, release, name, version,
       dataVersion: version.data_version ?? null,
       /// null when the file carries no usable index; then everything is read
       /// from the whole files.
@@ -134,7 +182,7 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
   /// batches; only the wanted parts are copied out.
   async function fetchSpliced(entry, section, batchRanges) {
     const ranges = entry[section];
-    const target = url(entry.library, 'neutron', entry.name, `${section}.arrow`);
+    const target = url(entry.library, entry.release, 'neutron', entry.name, `${section}.arrow`);
     const wanted = [...batchRanges].sort((a, b) => a.off - b.off);
     const cachedSchema = entry.schema[section];
     const parts = cachedSchema ? wanted : [ranges.schema, ...wanted];
@@ -149,9 +197,19 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
       const from = part.off - spans[i].off;
       return bodies[i].subarray(from, from + part.len);
     };
-    if (!cachedSchema) entry.schema[section] = cut(ranges.schema).slice();
+    // Every piece is checked against the sha256 in version.json: a wrong byte
+    // still frames as Arrow and would decode into wrong numbers.
+    const checked = async (part) => {
+      const bytes = cut(part);
+      const got = await sha256Hex(bytes);
+      if (got !== part.sha256) {
+        throw new Error(`${target}: bytes ${part.off}+${part.len} have sha256 ${got}, version.json says ${part.sha256}`);
+      }
+      return bytes;
+    };
+    if (!cachedSchema) entry.schema[section] = (await checked(ranges.schema)).slice();
     const schema = entry.schema[section];
-    const batches = wanted.map(cut);
+    const batches = await Promise.all(wanted.map(checked));
     const out = new Uint8Array(schema.length + batches.reduce((n, b) => n + b.length, 0) + EOS.length);
     out.set(schema, 0);
     let at = schema.length;
@@ -168,8 +226,8 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
     return once(entry, 'whole', async () => {
       if (entry.wholeLoaded) return;
       const [e, r] = await Promise.all([
-        fetchBytes(url(entry.library, 'neutron', entry.name, 'energy.arrow')),
-        fetchBytes(url(entry.library, 'neutron', entry.name, 'reactions.arrow')),
+        fetchBytes(url(entry.library, entry.release, 'neutron', entry.name, 'energy.arrow')),
+        fetchBytes(url(entry.library, entry.release, 'neutron', entry.name, 'reactions.arrow')),
       ]);
       for (const batch of decoder.readBatches(e.bytes)) {
         const { temperature, grid } = energyGrid(decoder, batch);
@@ -273,9 +331,10 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
   }
 
   async function loadElement(library, element) {
+    const release = await ensureRelease(library);
     const [version, got] = await Promise.all([
-      fetchVersion(library, 'photon', element),
-      fetchBytes(url(library, 'photon', element, 'element.arrow')),
+      fetchVersion(library, release, 'photon', element),
+      fetchBytes(url(library, release, 'photon', element, 'element.arrow')),
     ]);
     const [batch] = decoder.readBatches(got.bytes);
     const energy = decoder.f64List(batch, 'ln_energy').map(Math.exp);
@@ -300,8 +359,8 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
 
   /// The published index.json of one library and particle, parsed.
   async function loadIndex(library, particle) {
-    checkLibrary(library);
-    const target = `${origin}/${library}/${particle}/index.json`;
+    const release = await ensureRelease(library);
+    const target = `${origin}/${library}/${release}/${particle}/index.json`;
     const resp = await fetchImpl(target);
     if (resp.status === 404) throw new Error(`${library} publishes no ${particle} index`);
     if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} fetching ${target}`);
@@ -309,7 +368,7 @@ export function createEngine({ origin = ORIGIN, fetchImpl = fetch, decoder }) {
   }
 
   return {
-    series, photonSeries, loadIndex, ensureNuclide, temperaturesOf,
+    series, photonSeries, loadIndex, ensureNuclide, ensureRelease, temperaturesOf,
     get rangesStripped() { return rangesStripped; },
   };
 }

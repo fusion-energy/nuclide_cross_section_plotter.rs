@@ -18,13 +18,19 @@ third party.
 ## Where the data comes from
 
 The cross sections are the Arrow files published at
-`https://yamc-data.xsplot.com/<library>/<particle>/<Name>.arrow/`, the same
-files the [yamc](https://github.com/fusion-neutronics/yamc) Monte Carlo code
-reads. Each library also publishes an `index.json` per particle listing every
-nuclide, reaction and temperature, which is what the table is built from.
+`https://yamc-data.xsplot.com/<library>/<release>/<particle>/<Name>.arrow/`,
+the same files the [yamc](https://github.com/fusion-neutronics/yamc) Monte
+Carlo code reads. Each library is published as immutable releases, and
+`<library>/latest.json` names the current one; the page reads it once per
+library and takes every file of that library from that release. A release in
+a data format the page does not read is refused with a message rather than
+misread. Each release also publishes an `index.json` per particle listing
+every nuclide, reaction and temperature, which is what the table is built
+from.
 
 Nothing is downloaded until a reaction is ticked. Each nuclide's `version.json`
-carries the byte range of every record batch, and the reactions file is written
+carries the byte range and sha256 of every record batch (every piece fetched is
+checked against it), and the reactions file is written
 one batch per reaction and temperature, so plotting one cross section is one
 small HTTP range request plus the energy grid of that temperature. The pieces
 are spliced into an Arrow IPC stream and decoded in a Web Worker with
